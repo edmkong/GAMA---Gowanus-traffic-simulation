@@ -4,7 +4,7 @@ global {
 	// =========================
 	// Time / movement
 	// =========================
-	float step <- 10 #s;
+	float step <- 20 #s;
 	float arrival_threshold <- 0.00008;
 
 	// =========================
@@ -14,6 +14,7 @@ global {
 	file shapefile_bid <- shape_file("../includes/BID_vector.shp");
 	file shapefile_parking_spots <- shape_file("../includes/gowanus_final_spots.shp");
 	file shapefile_water <- shape_file("../includes/bid_water.shp");
+	file shapefile_public_parking <- shape_file("../includes/public_parking_facilities.shp");
 
 	geometry shape <- envelope(shapefile_roads);
 	geometry bid_geom <- nil;
@@ -55,22 +56,28 @@ global {
 	// Traffic controls
 	// =========================
 	int initial_cars <- 120;
-	float spawn_prob_per_step <- 0.18;
+	// Adjusted for 20s step to keep approximately the same per-minute arrival flow as 0.18 at 10s.
+	float spawn_prob_per_step <- 0.3276;
 	int max_new_cars_per_spawn <- 4;
 	float exit_prob_at_gateway <- 0.35;
 
 	// =========================
 	// Parking controls
 	// =========================
+	string scenario_mode <- "mixed_0.1_garage_0.1_street";
 	float initial_parking_occupied_rate <- 0.9;
-	float parking_destination_prob <- 0.2;
+	float garage_destination_prob <- 0.1;
+	float street_parking_destination_prob <- 0.1;
+	float street_first_destination_prob <- 0.2;
+	float garage_first_destination_prob <- 0.2;
+	int street_attempts_before_garage <- 10;
 	int max_parking_search_processes <- 10;
 
-	// Parking dwell-time model (step = 10s):
+	// Parking dwell-time model (step = 20s):
 	// short-term ~30 min, night-term ~7 h, long-term ~1 week
-	int short_term_mean_steps <- 300;
-	int night_term_mean_steps <- 3600;
-	int long_term_mean_steps <- 100800;
+	int short_term_mean_steps <- 90;
+	int night_term_mean_steps <- 1260;
+	int long_term_mean_steps <- 30240;
 
 	// Share of parked cars by profile
 	float parking_profile_short_share <- 0.55;
@@ -81,10 +88,10 @@ global {
 	// Recovery
 	// =========================
 	float min_progress_distance <- 0.000005;
-	int max_stagnant_steps <- 8;
-	int max_no_progress_steps <- 8;
+	int max_stagnant_steps <- 4;
+	int max_no_progress_steps <- 4;
 	int max_backtracks_per_car <- 4;
-	int max_stagnant_steps_while_backtracking <- 12;
+	int max_stagnant_steps_while_backtracking <- 6;
 
 	// =========================
 	// Metrics
@@ -102,6 +109,9 @@ global {
 	int cars_started_parking_search_count <- 0;
 	int cars_failed_parking_and_left_count <- 0;
 	int cars_parked_successfully_count <- 0;
+	int cars_assigned_to_garage_count <- 0;
+	int cars_failed_garage_and_left_count <- 0;
+	int cars_parked_in_garage_count <- 0;
 	int no_empty_spot_check_count <- 0;
 	int occupied_spot_arrival_count <- 0;
 	int total_parking_spot_visits_count <- 0;
@@ -163,6 +173,15 @@ global {
 
 		ask parking_space {
 			occupied <- flip(initial_parking_occupied_rate);
+		}
+
+		create public_parking_facility from: shapefile_public_parking with: [
+			facility_name::string(read("name")),
+			licensed_capacity::int(float(read("lic_cap"))),
+			midday_available::int(float(read("mid_avail")))
+		];
+		ask public_parking_facility {
+			current_occupied <- min([licensed_capacity, max([0, midday_occupied])]);
 		}
 
 		// Initial flowing cars
@@ -322,11 +341,21 @@ species parking_space {
 	int visited_count <- 0;
 
 	aspect default {
-		if occupied {
-			draw square(10) color: #red rotate: heading;
-		} else {
-			draw square(10) color: #green rotate: heading;
-		}
+		draw square(8) color: #yellow border: #black rotate: heading;
+	}
+}
+
+species public_parking_facility {
+	string facility_name <- "";
+	int licensed_capacity <- 0;
+	int midday_available <- 0;
+	int midday_occupied <- max([0, licensed_capacity - midday_available]);
+	int current_occupied <- 0;
+	int current_available <- max([0, licensed_capacity - current_occupied]);
+	bool full <- (current_occupied >= licensed_capacity) and (licensed_capacity > 0);
+
+	aspect default {
+		draw rectangle(50,30) color: #green border: #black;
 	}
 }
 
@@ -334,11 +363,12 @@ species car skills: [moving] {
 	point target <- nil;
 	point edge_target <- nil;
 	parking_space assigned_spot <- nil;
+	public_parking_facility assigned_garage <- nil;
 	int last_spot_index <- -1;
 
 	// moving | parked
 	string phase <- "moving";
-	// parking | edge
+	// parking | garage | edge
 	string destination_type <- "edge";
 
 	bool inside_bid_prev <- false;
@@ -411,6 +441,7 @@ species car skills: [moving] {
 		destination_type <- "edge";
 		target <- nil;
 		assigned_spot <- nil;
+		assigned_garage <- nil;
 		edge_target <- nil;
 		do reset_progress_trackers;
 		do choose_random_boundary_target;
@@ -432,6 +463,7 @@ species car skills: [moving] {
 		target <- nil;
 		edge_target <- nil;
 		assigned_spot <- nil;
+		assigned_garage <- nil;
 		last_spot_index <- -1;
 		destination_type <- "edge";
 		parking_search_processes <- 0;
@@ -455,6 +487,7 @@ species car skills: [moving] {
 		target <- nil;
 		edge_target <- nil;
 		assigned_spot <- nil;
+		assigned_garage <- nil;
 		last_spot_index <- -1;
 		destination_type <- "edge";
 		parking_search_processes <- 0;
@@ -485,6 +518,7 @@ species car skills: [moving] {
 
 		if assigned_spot != nil {
 			last_spot_index <- assigned_spot.index;
+			assigned_garage <- nil;
 			edge_target <- nil;
 
 			list<road> drivable_roads <- road where (each.navigable_for_agents);
@@ -506,12 +540,63 @@ species car skills: [moving] {
 		}
 	}
 
+	action choose_garage_target_or_leave {
+		list<public_parking_facility> free_garages <- public_parking_facility where (each.current_occupied < each.licensed_capacity);
+
+		if empty(free_garages) {
+			cars_failed_garage_and_left_count <- cars_failed_garage_and_left_count + 1;
+			if scenario_mode = "garage_0.2_then_street_if_full" {
+				destination_type <- "parking";
+				parking_search_processes <- 0;
+				cars_started_parking_search_count <- cars_started_parking_search_count + 1;
+				do choose_next_parking_search_target;
+				if target = nil {
+					do restart_parking_search_or_leave;
+				}
+			} else {
+				do switch_to_edge_mode;
+			}
+		} else {
+			assigned_garage <- one_of(free_garages);
+			cars_assigned_to_garage_count <- cars_assigned_to_garage_count + 1;
+			assigned_spot <- nil;
+			edge_target <- nil;
+			destination_type <- "garage";
+
+			list<road> drivable_roads <- road where (each.navigable_for_agents);
+			if empty(drivable_roads) {
+				drivable_roads <- road where (each.drivable);
+			}
+			if not empty(drivable_roads) {
+				road approach_road <- drivable_roads with_min_of (each.location distance_to assigned_garage.location);
+				if approach_road != nil {
+					target <- any_location_in(approach_road);
+				} else {
+					target <- assigned_garage.location;
+				}
+			} else {
+				target <- assigned_garage.location;
+			}
+
+			do reset_progress_trackers;
+		}
+	}
+
 	action restart_parking_search_or_leave {
 		parking_search_processes <- parking_search_processes + 1;
 
-		if parking_search_processes >= max_parking_search_processes {
-			cars_failed_parking_and_left_count <- cars_failed_parking_and_left_count + 1;
-			do switch_to_edge_mode;
+		int street_attempt_limit <- max_parking_search_processes;
+		if scenario_mode = "street_0.2_then_garage_after_10" {
+			street_attempt_limit <- street_attempts_before_garage;
+		}
+
+		if parking_search_processes >= street_attempt_limit {
+			if scenario_mode = "street_0.2_then_garage_after_10" {
+				do choose_garage_target_or_leave;
+			} else {
+				cars_failed_parking_and_left_count <- cars_failed_parking_and_left_count + 1;
+				do switch_to_edge_mode;
+			}
 		} else {
 			do choose_next_parking_search_target;
 		}
@@ -531,14 +616,38 @@ species car skills: [moving] {
 	}
 
 	action choose_initial_destination {
-		if flip(parking_destination_prob) {
-			destination_type <- "parking";
-			parking_search_processes <- 0;
-			cars_started_parking_search_count <- cars_started_parking_search_count + 1;
-			do choose_next_parking_search_target;
+		float r <- rnd(1.0);
+		if scenario_mode = "street_0.2_then_garage_after_10" {
+			if r < street_first_destination_prob {
+				destination_type <- "parking";
+				parking_search_processes <- 0;
+				cars_started_parking_search_count <- cars_started_parking_search_count + 1;
+				do choose_next_parking_search_target;
+			} else {
+				parking_search_processes <- 0;
+				do switch_to_edge_mode;
+			}
+		} else if scenario_mode = "garage_0.2_then_street_if_full" {
+			if r < garage_first_destination_prob {
+				destination_type <- "garage";
+				do choose_garage_target_or_leave;
+			} else {
+				parking_search_processes <- 0;
+				do switch_to_edge_mode;
+			}
 		} else {
-			parking_search_processes <- 0;
-			do switch_to_edge_mode;
+			if r < garage_destination_prob {
+				destination_type <- "garage";
+				do choose_garage_target_or_leave;
+			} else if r < (garage_destination_prob + street_parking_destination_prob) {
+				destination_type <- "parking";
+				parking_search_processes <- 0;
+				cars_started_parking_search_count <- cars_started_parking_search_count + 1;
+				do choose_next_parking_search_target;
+			} else {
+				parking_search_processes <- 0;
+				do switch_to_edge_mode;
+			}
 		}
 	}
 
@@ -567,8 +676,13 @@ species car skills: [moving] {
 	reflex enforce_destination_state when: (phase = "moving") {
 		if destination_type = "parking" {
 			edge_target <- nil;
+			assigned_garage <- nil;
+		} else if destination_type = "garage" {
+			edge_target <- nil;
+			assigned_spot <- nil;
 		} else if destination_type = "edge" {
 			assigned_spot <- nil;
+			assigned_garage <- nil;
 		}
 	}
 
@@ -579,10 +693,16 @@ species car skills: [moving] {
 		}
 	}
 
+	reflex ensure_garage_target when: ((phase = "moving") and (destination_type = "garage") and (target = nil)) {
+		do choose_garage_target_or_leave;
+	}
+
 	reflex recover_if_off_graph when: ((phase = "moving") and (current_edge = nil)) {
 		do snap_to_nearest_drivable_road;
 		if destination_type = "parking" {
 			do restart_parking_search_or_leave;
+		} else if destination_type = "garage" {
+			do choose_garage_target_or_leave;
 		} else {
 			do choose_random_boundary_target;
 		}
@@ -604,8 +724,12 @@ species car skills: [moving] {
 			if assigned_spot != nil {
 				assigned_spot.occupied <- false;
 			}
+			if assigned_garage != nil {
+				assigned_garage.current_occupied <- max([0, assigned_garage.current_occupied - 1]);
+			}
 			phase <- "moving";
 			assigned_spot <- nil;
+			assigned_garage <- nil;
 			parked_steps <- 0;
 			parking_search_processes <- 0;
 			do switch_to_edge_mode;
@@ -641,6 +765,8 @@ species car skills: [moving] {
 		if stagnant_steps >= max_stagnant_steps or (no_progress_steps >= max_no_progress_steps and (not reached_target) and (not reached_assigned_spot)) {
 			if destination_type = "parking" {
 				do restart_parking_search_or_leave;
+			} else if destination_type = "garage" {
+				do choose_garage_target_or_leave;
 			} else {
 				do choose_random_boundary_target;
 			}
@@ -663,16 +789,24 @@ species car skills: [moving] {
 					occupied_spot_arrival_count <- occupied_spot_arrival_count + 1;
 					do restart_parking_search_or_leave;
 				}
+				} else if destination_type = "garage" {
+					if (assigned_garage != nil) and (assigned_garage.current_occupied < assigned_garage.licensed_capacity) {
+						location <- assigned_garage.location;
+						assigned_garage.current_occupied <- assigned_garage.current_occupied + 1;
+						do assign_parking_profile;
+						phase <- "parked";
+						ever_parked <- true;
+						parked_steps <- 0;
+						cars_parked_in_garage_count <- cars_parked_in_garage_count + 1;
+					} else {
+						do choose_garage_target_or_leave;
+					}
+				}
 			}
 		}
-	}
 
 	aspect default {
-		if destination_type = "parking" {
-			draw circle(7) color: #blue;
-		} else {
-			draw circle(7) color: rgb(255,140,0);
-		}
+		draw circle(7) color: #blue;
 	}
 }
 
@@ -680,7 +814,12 @@ experiment boundary_flow type: gui {
 	parameter "Initial cars" var: initial_cars category: "Traffic";
 	parameter "Spawn probability per step" var: spawn_prob_per_step category: "Traffic";
 	parameter "Max new cars per spawn" var: max_new_cars_per_spawn category: "Traffic";
-	parameter "Parking destination probability" var: parking_destination_prob category: "Parking";
+	parameter "Scenario" var: scenario_mode category: "Scenario" among: ["mixed_0.1_garage_0.1_street","street_0.2_then_garage_after_10","garage_0.2_then_street_if_full"];
+	parameter "Garage destination probability" var: garage_destination_prob category: "Destination Mix";
+	parameter "Street parking destination probability" var: street_parking_destination_prob category: "Destination Mix";
+	parameter "Street-first destination probability" var: street_first_destination_prob category: "Destination Mix";
+	parameter "Garage-first destination probability" var: garage_first_destination_prob category: "Destination Mix";
+	parameter "Street attempts before garage" var: street_attempts_before_garage category: "Scenario";
 	parameter "Max parking search processes" var: max_parking_search_processes category: "Parking";
 	parameter "Arrival threshold" var: arrival_threshold category: "Movement";
 
@@ -688,6 +827,13 @@ experiment boundary_flow type: gui {
 			monitor "Parking | Occupied Spots" value: length(parking_space where (each.occupied));
 			monitor "Parking | Free Spots" value: length(parking_space where (not each.occupied));
 			monitor "Parking | Occupancy %" value: round((100.0 * (length(parking_space where (each.occupied)) / max([1.0, float(length(parking_space))])) * 100.0) / 100.0);
+			monitor "Scenario | Active" value: scenario_mode;
+			monitor "Public Parking | Occupied / Total" value: (string(sum(public_parking_facility collect each.current_occupied)) + " / " + string(sum(public_parking_facility collect each.licensed_capacity)));
+			monitor "Public Parking | Occupancy %" value: round((100.0 * (sum(public_parking_facility collect each.current_occupied) / max([1.0, float(sum(public_parking_facility collect each.licensed_capacity))])) * 100.0) / 100.0);
+			monitor "Garage Flow | Cars Currently Going To Garage" value: length(car where ((each.phase = "moving") and (each.destination_type = "garage")));
+			monitor "Garage Flow | Cars Assigned To Garage (Cumulative)" value: cars_assigned_to_garage_count;
+			monitor "Garage Flow | Cars Parked In Garage (Cumulative)" value: cars_parked_in_garage_count;
+			monitor "Garage Flow | Failed To Find Garage Then Left" value: cars_failed_garage_and_left_count;
 			monitor "Traffic | Cars In BID Looking For Parking" value: length(car where ((bid_geom != nil) and (each.location intersects bid_geom) and (each.phase = "moving") and (each.destination_type = "parking")));
 			monitor "Traffic | Cars In BID Passing Through To Edge" value: length(car where ((bid_geom != nil) and (each.location intersects bid_geom) and (each.phase = "moving") and (each.destination_type = "edge")));
 			monitor "Traffic | Failed To Park Then Left" value: cars_failed_parking_and_left_count;
@@ -697,17 +843,20 @@ experiment boundary_flow type: gui {
 			species road;
 			species bid_boundary aspect: debug_geom;
 			species parking_space;
+			species public_parking_facility;
 			species car;
 		}
 
 			display parking_capacity_and_occupancy {
-				chart "Parking Spots: Occupied vs Free" type: series style: spline {
-					data "Occupied Spots" value: length(parking_space where (each.occupied)) color: #red;
-					data "Free Spots" value: length(parking_space where (not each.occupied)) color: #green;
+				chart "Street vs Garage: Occupied and Free Spots" type: series style: spline {
+					data "Street Occupied" value: length(parking_space where (each.occupied)) color: #red;
+					data "Street Free" value: length(parking_space where (not each.occupied)) color: #green;
+					data "Garage Occupied" value: sum(public_parking_facility collect each.current_occupied) color: rgb(200,120,0);
+					data "Garage Free" value: sum(public_parking_facility collect each.current_available) color: #yellow;
 				}
-				chart "Parking Occupancy %" type: series style: spline {
-					data "Occupied %" value: 100.0 * (length(parking_space where (each.occupied)) / max([1.0, float(length(parking_space))])) color: #red;
-					data "Target 90%" value: 90.0 color: rgb(80,80,80);
+				chart "Street vs Garage: Occupancy %" type: series style: spline {
+					data "Street Occupancy %" value: 100.0 * (length(parking_space where (each.occupied)) / max([1.0, float(length(parking_space))])) color: #red;
+					data "Garage Occupancy %" value: 100.0 * (sum(public_parking_facility collect each.current_occupied) / max([1.0, float(sum(public_parking_facility collect each.licensed_capacity))])) color: rgb(200,120,0);
 				}
 			}
 
@@ -720,7 +869,9 @@ experiment boundary_flow type: gui {
 
 			display failed_parking_then_left_over_time {
 				chart "Failed To Park Then Left (Cumulative)" type: series style: spline {
-					data "Failed To Park Then Left" value: cars_failed_parking_and_left_count color: rgb(120,120,120);
+					data "Failed To Park Then Left (Total)" value: (cars_failed_parking_and_left_count + cars_failed_garage_and_left_count) color: rgb(120,120,120);
+					data "Street Parking Failed Then Left" value: cars_failed_parking_and_left_count color: rgb(180,60,60);
+					data "Garage Failed Then Left" value: cars_failed_garage_and_left_count color: rgb(80,80,80);
 				}
 			}
 	}
